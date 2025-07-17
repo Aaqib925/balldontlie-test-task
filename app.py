@@ -1,19 +1,20 @@
 import os
+import requests
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 from balldontlie import BalldontlieAPI
 from balldontlie.exceptions import (
     AuthenticationError,
     RateLimitError,
-    ValidationError,
+    ValidationError as BoValidationError,
     NotFoundError,
     ServerError,
     BallDontLieException
 )
+from pydantic import ValidationError as PydanticValidationError
 
 
 def create_app():
-    """Application factory function"""
     load_dotenv()
     app = Flask(__name__)
 
@@ -25,14 +26,12 @@ def create_app():
 
         api = BalldontlieAPI(api_key=api_key)
         results = {}
-
         for league in ('nba', 'mlb', 'nfl'):
             try:
                 teams = getattr(getattr(api, league), 'teams').list()
                 results[league] = "Working"
             except Exception as e:
                 results[league] = f"Failed: {str(e)}"
-
         return jsonify(results), 200
 
     @app.route('/test-config', methods=['GET'])
@@ -61,26 +60,55 @@ def create_app():
         try:
             api = BalldontlieAPI(api_key=api_key)
 
-            # Use .get(...) to fetch standings for a season
-            standings_response = api.mlb.standings.get(season=int(season))
+            # Attempt SDK call, fallback to raw HTTP if it fails
+            try:
+                standings_response = api.mlb.standings.get(season=int(season))
+                standings_data = (
+                    standings_response.data
+                    if hasattr(standings_response, 'data')
+                    else standings_response
+                )
+            except (AttributeError, PydanticValidationError):
+                url = "https://api.balldontlie.io/mlb/v1/standings"
+                resp = requests.get(
+                    url,
+                    params={"season": int(season)},
+                    headers={"Authorization": api_key}
+                )
+                if resp.status_code != 200:
+                    return jsonify({"error": f"Raw API request failed ({resp.status_code})"}), 502
+                raw = resp.json()
+                standings_data = raw.get("data", raw)
 
-            # Extract the list of MLBStandings model objects
-            standings_data = (
-                standings_response.data
-                if hasattr(standings_response, 'data')
-                else standings_response
-            )
+            # Normalize each entry to (tid, name, wins, losses, win_pct)
+            for entry in standings_data:
+                if isinstance(entry, dict):
+                    team_info = entry.get('team', {})
+                    tid = team_info.get('id')
+                    name = team_info.get('display_name') or team_info.get('full_name', '')
+                    wins = entry.get('wins', 0)
+                    losses = entry.get('losses', 0)
+                    win_pct = (
+                        entry.get('win_percent')
+                        or entry.get('win_percentage')
+                        or 0.0
+                    )
+                else:
+                    # entry is a model object
+                    team_info = entry.team
+                    tid = team_info.id
+                    name = team_info.display_name or getattr(team_info, 'full_name', '')
+                    wins = entry.wins or 0
+                    losses = entry.losses or 0
+                    win_pct = entry.win_percent or 0.0
 
-            # Find the matching team
-            for standing in standings_data:
-                # standing is an MLBStandings model; access attributes directly
-                if standing.team.id == team_id:
+                if tid == team_id:
                     return jsonify({
-                        "team_id": standing.team.id,
-                        "team_name": standing.team.display_name,
-                        "wins": standing.wins or 0,
-                        "losses": standing.losses or 0,
-                        "win_percentage": standing.win_percent or 0.0
+                        "team_id": tid,
+                        "team_name": name,
+                        "wins": wins,
+                        "losses": losses,
+                        "win_percentage": win_pct
                     }), 200
 
             return jsonify({"error": "Team not found for season"}), 404
@@ -89,7 +117,7 @@ def create_app():
             return jsonify({"error": "Invalid API key"}), 502
         except RateLimitError:
             return jsonify({"error": "Rate limit exceeded"}), 502
-        except ValidationError:
+        except BoValidationError:
             return jsonify({"error": "Invalid request parameters"}), 400
         except NotFoundError:
             return jsonify({"error": "Resource not found"}), 404
@@ -98,7 +126,6 @@ def create_app():
         except BallDontLieException:
             return jsonify({"error": "External API request failed"}), 502
         except Exception as e:
-            # Log the exception internally if you like, then:
             return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
     return app
